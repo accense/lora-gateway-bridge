@@ -1,8 +1,12 @@
 package mqttpubsub
 
 import (
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"fmt"
+	"io/ioutil"
+	"strings"
 	"sync"
 	"time"
 
@@ -22,6 +26,15 @@ type Backend struct {
 
 // NewBackend creates a new Backend.
 func NewBackend(server, username, password string) (*Backend, error) {
+	log.WithField("server", server).Info("server: server")
+	log.WithField("hasPrefix", strings.HasPrefix(server, "tls")).Info("server: server")
+	if strings.HasPrefix(server, "tls") {
+		return NewTLSBackend(server, username, "root-CA.crt", "cert.pem", "priv.key")
+	}
+	return newBackend(server, username, password)
+}
+
+func newBackend(server, username, password string) (*Backend, error) {
 	b := Backend{
 		txPacketChan: make(chan gw.TXPacketBytes),
 		gateways:     make(map[lorawan.EUI64]struct{}),
@@ -35,6 +48,46 @@ func NewBackend(server, username, password string) (*Backend, error) {
 	opts.SetConnectionLostHandler(b.onConnectionLost)
 
 	log.WithField("server", server).Info("backend: connecting to mqtt broker")
+	b.conn = mqtt.NewClient(opts)
+	if token := b.conn.Connect(); token.Wait() && token.Error() != nil {
+		return nil, token.Error()
+	}
+
+	return &b, nil
+}
+
+// NewTLSBackend creates a new Backend with TLS.
+func NewTLSBackend(server, clientId, caFile, certFile, keyFile string) (*Backend, error) {
+	// Cert and Key
+	certificate, err := tls.LoadX509KeyPair(certFile, keyFile)
+	if err != nil {
+		return nil, err
+	}
+	// CA
+	cacerts := x509.NewCertPool()
+	if pemData, err := ioutil.ReadFile(caFile); err != nil {
+		return nil, err
+	} else {
+		cacerts.AppendCertsFromPEM(pemData)
+	}
+
+	tlsConfig := &tls.Config{
+		Certificates: []tls.Certificate{certificate},
+		RootCAs:      cacerts,
+	}
+
+	b := Backend{
+		txPacketChan: make(chan gw.TXPacketBytes),
+		gateways:     make(map[lorawan.EUI64]struct{}),
+	}
+
+	opts := mqtt.NewClientOptions()
+	opts.AddBroker(server)
+	opts.SetTLSConfig(tlsConfig)
+	opts.SetOnConnectHandler(b.onConnected)
+	opts.SetConnectionLostHandler(b.onConnectionLost)
+
+	log.WithField("server", server).Info("backend: connecting to mqtt broker with TLS")
 	b.conn = mqtt.NewClient(opts)
 	if token := b.conn.Connect(); token.Wait() && token.Error() != nil {
 		return nil, token.Error()
